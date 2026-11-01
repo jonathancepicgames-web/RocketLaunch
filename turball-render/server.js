@@ -10,7 +10,7 @@ const STATIC_ROOT = path.resolve(__dirname, '../turball_extracted');
 const INDEX_FILE = path.join(STATIC_ROOT, 'index.html');
 const PARTY_API_ORIGIN = new URL(process.env.TURBALL_API_ORIGIN || 'https://api.turball.io');
 // Allow slow matchmaker and seat-join handshakes more time through the Render proxy.
-const configuredPartyApiTimeout = Number(process.env.TURBALL_API_TIMEOUT_MS || 120000);
+const configuredPartyApiTimeout = Number(process.env.TURBALL_API_TIMEOUT_MS || 80000);
 const PARTY_API_TIMEOUT_MS = Number.isFinite(configuredPartyApiTimeout)
   ? Math.min(300000, Math.max(20000, configuredPartyApiTimeout))
   : 120000;
@@ -302,6 +302,13 @@ function proxyHttpToPartyApi(req, res) {
   delete headers.trailer;
   delete headers.upgrade;
 
+  const requestStartedAt = Date.now();
+  const proxyRequestId = `pm-${requestStartedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const isMatchmakeRequest = upstreamUrl.pathname.startsWith('/matchmake/');
+  if (isMatchmakeRequest) {
+    console.log(`[party-api] Matchmake request ${proxyRequestId} ${req.method} ${upstreamUrl.pathname}`);
+  }
+
   const upstreamRequest = transport.request({
     protocol: upstreamUrl.protocol,
     hostname: upstreamUrl.hostname,
@@ -312,8 +319,7 @@ function proxyHttpToPartyApi(req, res) {
   }, (upstreamResponse) => {
     const isMatchmakeResponse = upstreamUrl.pathname.startsWith('/matchmake/')
       && (upstreamResponse.statusCode || 500) >= 200
-      && (upstreamResponse.statusCode || 500) < 300
-      && String(upstreamResponse.headers['content-type'] || '').includes('application/json');
+      && (upstreamResponse.statusCode || 500) < 300;
 
     if (!isMatchmakeResponse) {
       const statusCode = upstreamResponse.statusCode || 502;
@@ -328,8 +334,11 @@ function proxyHttpToPartyApi(req, res) {
         });
         upstreamResponse.on('end', () => {
           const cfRay = upstreamResponse.headers['cf-ray'] || upstreamResponse.headers['Cf-Ray'] || 'not-provided';
+          const cfErrorType = upstreamResponse.headers['cf-error-type'] || 'not-provided';
+          const cfErrorOrigin = upstreamResponse.headers['cf-error-origin'] || 'not-provided';
+          const elapsedMs = Date.now() - requestStartedAt;
           const detail = Buffer.concat(errorChunks).toString('utf8').replace(/\s+/g, ' ').slice(0, 500);
-          console.warn(`[party-api] Upstream HTTP failure status=${statusCode} path=${upstreamUrl.pathname} host=${upstreamUrl.host} cfRay=${cfRay} detail=${detail || '(empty body)'}`);
+          console.warn(`[party-api] Upstream HTTP failure status=${statusCode} path=${upstreamUrl.pathname} host=${upstreamUrl.host} elapsedMs=${elapsedMs} cfRay=${cfRay} cfErrorType=${cfErrorType} cfErrorOrigin=${cfErrorOrigin} detail=${detail || '(empty body)'}`);
         });
       }
       const responseHeaders = { ...upstreamResponse.headers };
@@ -347,14 +356,28 @@ function proxyHttpToPartyApi(req, res) {
       const rawBody = Buffer.concat(chunks).toString('utf8');
       let body;
       try {
+        if (!rawBody.trim()) throw new Error('empty JSON response body');
         body = JSON.parse(rawBody);
-      } catch {
-        const responseHeaders = { ...upstreamResponse.headers };
-        delete responseHeaders.connection;
-        delete responseHeaders['keep-alive'];
-        delete responseHeaders.upgrade;
-        res.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
-        res.end(rawBody);
+        if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('matchmaking response was not a JSON object');
+      } catch (parseError) {
+        const cfRay = upstreamResponse.headers['cf-ray'] || upstreamResponse.headers['Cf-Ray'] || 'not-provided';
+        const detail = rawBody.replace(/\s+/g, ' ').slice(0, 240);
+        console.warn(`[party-api] Invalid matchmaking JSON request=${proxyRequestId} status=${upstreamResponse.statusCode || 502} bytes=${Buffer.byteLength(rawBody)} cfRay=${cfRay} reason=${parseError.message} body=${detail || '(empty)'}`);
+        const payload = Buffer.from(JSON.stringify({
+          ok: false,
+          error: `The matchmaking origin returned an ${rawBody.trim() ? 'invalid' : 'empty'} JSON response. Check the Render [party-api] log for request ${proxyRequestId}.`,
+          code: 'invalid_matchmake_json',
+          requestId: proxyRequestId,
+          upstreamStatus: upstreamResponse.statusCode || 502,
+          cfRay,
+        }));
+        res.writeHead(502, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Content-Length': String(payload.length),
+          'Cache-Control': 'no-store',
+          'X-Party-Proxy-Request-Id': proxyRequestId,
+        });
+        res.end(payload);
         return;
       }
 
@@ -369,8 +392,11 @@ function proxyHttpToPartyApi(req, res) {
       delete responseHeaders['content-encoding'];
       delete responseHeaders['transfer-encoding'];
       responseHeaders['content-length'] = String(responseBody.length);
+      responseHeaders['x-party-proxy-request-id'] = proxyRequestId;
+      responseHeaders['cache-control'] = 'no-store';
       res.writeHead(upstreamResponse.statusCode || 502, responseHeaders);
       res.end(responseBody);
+      console.log(`[party-api] Matchmake response request=${proxyRequestId} status=${upstreamResponse.statusCode || 502} bytes=${responseBody.length} elapsedMs=${Date.now() - requestStartedAt}`);
 
       if (body?.processId) {
         const addressState = originalPublicAddress ? 'matchmaker publicAddress supplied' : 'publicAddress absent; API-origin fallback';
@@ -385,14 +411,22 @@ function proxyHttpToPartyApi(req, res) {
   });
 
   upstreamRequest.setTimeout(PARTY_API_TIMEOUT_MS, () => {
-    upstreamRequest.destroy(new Error('Party API request timed out'));
+    const timeoutError = new Error(`Party API request timed out after ${PARTY_API_TIMEOUT_MS}ms`);
+    timeoutError.code = 'ETIMEDOUT';
+    upstreamRequest.destroy(timeoutError);
   });
   upstreamRequest.on('error', (error) => {
-    console.error('[party-api] HTTP proxy error:', error.message);
+    console.error(`[party-api] HTTP proxy error request=${proxyRequestId} path=${upstreamUrl.pathname} elapsedMs=${Date.now() - requestStartedAt}:`, error.message);
     if (!res.headersSent) {
-      res.status(502).json({
+      res.set('Cache-Control', 'no-store');
+      res.set('X-Party-Proxy-Request-Id', proxyRequestId);
+      res.status(error.code === 'ETIMEDOUT' ? 504 : 502).json({
         ok: false,
-        error: 'The party service could not be reached. Please try again.',
+        code: error.code || 'upstream_unreachable',
+        requestId: proxyRequestId,
+        error: error.code === 'ETIMEDOUT'
+          ? `The matchmaking origin did not respond within ${PARTY_API_TIMEOUT_MS}ms.`
+          : 'The party service could not be reached.',
       });
     } else {
       res.destroy(error);
