@@ -279,9 +279,22 @@ function observeWebSocketFrames(stream, direction, context) {
           ? payload.subarray(2).toString('utf8').replace(/[\r\n\t]+/g, ' ').slice(0, 240)
           : '';
         console.log(`[party-api] WS ${context} ${direction}: CLOSE code=${closeCode} reason=${JSON.stringify(closeReason)}`);
-      } else if ((opcode === 0x1 || opcode === 0x2) && dataFramesLogged < 5) {
+      } else if ((opcode === 0x1 || opcode === 0x2) && dataFramesLogged < 18) {
         dataFramesLogged += 1;
-        console.log(`[party-api] WS ${context} ${direction}: data frame opcode=${opcode} bytes=${payloadLength}`);
+        let messageType = '';
+        if (opcode === 0x2 && payloadLength > 0) {
+          let payload = buffered.subarray(payloadStart, payloadStart + payloadLength);
+          if (masked) {
+            payload = Buffer.from(payload);
+            const maskStart = consumed + headerLength;
+            for (let index = 0; index < payload.length; index += 1) {
+              payload[index] ^= buffered[maskStart + (index % 4)];
+            }
+          }
+          const types = { 10: 'JOIN_ROOM', 11: 'ERROR', 12: 'LEAVE_ROOM', 13: 'ROOM_DATA', 14: 'ROOM_STATE', 15: 'ROOM_STATE_PATCH', 16: 'ROOM_DATA_SCHEMA', 17: 'ROOM_DATA_BYTES', 18: 'PING', 19: 'ROOM_INPUT_RELIABLE', 20: 'ROOM_INPUT_UNRELIABLE' };
+          messageType = ` colyseusType=${types[payload[0]] || `UNKNOWN_${payload[0]}`}`;
+        }
+        console.log(`[party-api] WS ${context} ${direction}: data frame opcode=${opcode} bytes=${payloadLength}${messageType}`);
       }
       consumed += frameLength;
     }
