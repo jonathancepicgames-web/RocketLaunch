@@ -8,6 +8,9 @@ const WebSocket = require('ws');
 const PORT = Number(process.env.PORT || 3000);
 const STATIC_ROOT = path.resolve(__dirname, '../turball_extracted');
 const INDEX_FILE = path.join(STATIC_ROOT, 'index.html');
+const ACTIVE_GAME_RELEASE = 'c9f289f8703c-41278748786-1';
+const EXTRACTED_GAME_RELEASE = '487732d9f2ee-39108558102-1';
+const GAME_ENTRY = 'game-NXJCU5YD.js';
 const PARTY_API_ORIGIN = new URL(process.env.TURBALL_API_ORIGIN || 'https://api.turball.io');
 // Allow slow matchmaker and seat-join handshakes more time through the Render proxy.
 const configuredPartyApiTimeout = Number(process.env.TURBALL_API_TIMEOUT_MS || 80000);
@@ -192,6 +195,7 @@ async function sendGameIndex(req, res, next) {
       /<meta\s+name="api-base"\s+content="[^"]*"\s*\/?\s*>/i,
       `<meta name="api-base" content="${origin}">`,
     );
+    html = html.replace(/src="assets\/app\/game-[^"]+\.js"/i, `src="assets/app/${GAME_ENTRY}"`);
     res.set('Cache-Control', 'no-store');
     res.type('html').send(html);
   } catch (error) {
@@ -703,6 +707,13 @@ app.get('/multiplayer.js', (req, res) => res.sendFile(path.join(__dirname, 'publ
 
 app.get('/', sendGameIndex);
 app.get('/index.html', sendGameIndex);
+app.use((req, res, next) => {
+  const activeReleasePrefix = `/assets/releases/${ACTIVE_GAME_RELEASE}/`;
+  if (req.url.startsWith(activeReleasePrefix)) {
+    req.url = req.url.replace(activeReleasePrefix, `/assets/releases/${EXTRACTED_GAME_RELEASE}/`);
+  }
+  next();
+});
 app.use(express.static(STATIC_ROOT));
 
 app.use((req, res) => {
